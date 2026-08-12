@@ -1,0 +1,56 @@
+# The sidecar's isolation policy, shipped inside the gem.
+#
+# This fragment carries the tenet: the sidecar must never hinder anything running
+# in development. Each choice below is that tenet applied.
+#
+#   source mounted ro   the container physically cannot write your working tree
+#   cpu/memory caps     a runaway sensor cannot starve the app you are running
+#   nice + ionice       what the caps miss, the scheduler priority covers
+#
+# It ships here rather than being generated into a project because a generated
+# file is copied once and never improved again, where this improves with a bundle
+# bump. A project extends it with its own overlay; `sidecar start` loads this
+# first and the overlay second.
+#
+# Every variable below is exported by Sidecar::Stack#limits, which is a fixed
+# core-owned list. A project needing more uses its overlay or compose's own .env.
+
+name: sidecar
+
+services:
+  runner:
+    # No image here. A project's overlay supplies one, because what a pass needs
+    # installed is a fact about that project and core cannot guess it.
+    working_dir: ${SIDECAR_WORKDIR:-/app}
+
+    # Absolute on both sides. The source path is exported rather than written as
+    # "." because this file lives inside the installed gem: a relative source
+    # would resolve against whichever directory compose chose, and if that ever
+    # differed the sidecar would mount the gem instead of the project and never
+    # complain. `sidecar start` refuses when the two disagree.
+    #
+    # :ro is the load-bearing part. The container cannot write the tree it is
+    # watching, so a sensor cannot corrupt the work in progress, and the watcher
+    # cannot trigger itself by writing where it polls.
+    volumes:
+      - ${SIDECAR_ROOT}:${SIDECAR_WORKDIR:-/app}:ro
+      # Artifacts go to a named volume rather than back into the read-only
+      # mount. The host reads them through its own copy of the path.
+      - sidecar_artifacts:${SIDECAR_WORKDIR:-/app}/${SIDECAR_ARTIFACTS:-tmp/sidecar}
+
+    environment:
+      SIDECAR_CONTAINER: "1"
+      SIDECAR_LOCATION: ${SIDECAR_LOCATION:-container}
+
+    # The gem cannot assume a project ships a binstub, so it invokes the
+    # executable bundler installed.
+    command: [ "bundle", "exec", "sidecar", "watch" ]
+
+    deploy:
+      resources:
+        limits:
+          cpus: "${SIDECAR_CPUS:-2}"
+          memory: ${SIDECAR_MEMORY:-2g}
+
+volumes:
+  sidecar_artifacts:

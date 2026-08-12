@@ -1,0 +1,357 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Sidecar — a continuous readout of a project's existing quality tools, narrowed
+# to the lines that just changed.
+#
+# Deliberately boots nothing. A pass has to be cheap enough to run on every edit.
+#
+# Usage:
+#   sidecar start  [--dir PATH]
+#   sidecar stop
+#   sidecar reseed
+#   sidecar once   [--base REF] [--dir PATH] [--quiet] [--host]
+#   sidecar run --slow [--base REF] [--dir PATH]
+#   sidecar gate   --base REF [--only a,b]
+#   sidecar watch  [--base REF] [--dir PATH]
+#   sidecar status [--dir PATH]
+#   sidecar dashboard [--dir PATH] [--plain]
+#   sidecar nudge  [--dir PATH]
+#
+# EXIT CODES ARE KEYED BY COMMAND. The same number means different things in
+# different ones, and this table is the contract:
+#
+#   once / run / gate   0 clean   1 findings on changed lines   2 the run failed
+#   gate                                                        3 could not see the change
+#   status              0 fresh   1 stale                       2 down
+#   start/stop/reseed   0 ok                                    2 failed
+#   nudge               0 always
+#
+# A reader that needs to be certain should read status.json's `schema` field
+# rather than infer anything from a number. The collision between `once` and
+# `status` is documented rather than renumbered: renumbering would spend a
+# rename budget that was deliberately kept at zero.
+
+require "optparse"
+
+require "sidecar"
+require "sidecar/dashboard"
+require "sidecar/liveness"
+require "sidecar/report"
+require "sidecar/scan"
+require "sidecar/stack"
+require "sidecar/watcher"
+
+module Sidecar
+  module CLI
+    module_function
+
+    EXIT_CLEAN = 0
+    EXIT_RED = 1
+    EXIT_FAILED = 2
+    # Its own code, because a gate that cannot see the change is a different
+    # answer from a gate that looked and found nothing. The old script exited 0
+    # in both cases — a guardrail reporting success at exactly the moment it was
+    # not working.
+    EXIT_BLIND = 3
+
+    COMMANDS = %w[start stop reseed once run gate watch status dashboard nudge].freeze
+
+    def parse(argv)
+      options = { quiet: false, host: false }
+
+      parser = OptionParser.new do |opts|
+        opts.banner = "Usage: sidecar {#{COMMANDS.join('|')}} [options]"
+        opts.on("--slow", "run: the expensive tier, now, on demand") { options[:slow] = true }
+        opts.on("--base REF", "Diff against REF") { |ref| options[:base] = ref }
+        opts.on("--only LIST", "gate: run only these sensors") { |l| options[:only] = l.split(",").map(&:to_sym) }
+        opts.on("--dir PATH", "Artifact directory") { |path| options[:dir] = path }
+        opts.on("--quiet", "Write the artifacts without printing the digest") { options[:quiet] = true }
+        opts.on("--host", "Run the pass here even if the stack is up") { options[:host] = true }
+        opts.on("--plain", "dashboard: print one frame, no escape codes") { options[:plain] = true }
+        opts.on("-h", "--help", "Show this message") { options[:help] = opts.help }
+      end
+
+      argv = argv.dup
+      options[:command] = argv.shift if COMMANDS.include?(argv.first)
+      parser.parse!(argv)
+      options
+    end
+
+    def run(argv)
+      options = parse(argv)
+      return puts(options[:help]) || EXIT_CLEAN if options[:help]
+      return usage unless COMMANDS.include?(options[:command])
+
+      dispatch(options)
+    rescue Sidecar::MissingConfig, Sidecar::Project::InvalidProject => e
+      # Exit 2 with the worked example inline. Not a link (a second thing to keep
+      # in sync) and not a generator (a file copied once is never improved).
+      warn e.message
+      EXIT_FAILED
+    end
+
+    def dispatch(options)
+      case options[:command]
+      when "start" then start(options)
+      when "stop" then stop(options)
+      when "reseed" then reseed(options)
+      when "once" then once(options)
+      when "run" then run_tier(options)
+      when "gate" then gate(options)
+      when "watch" then watch(options)
+      when "status" then status(options)
+      when "dashboard" then dashboard(options)
+      when "nudge" then nudge(options)
+      end
+    end
+
+    # Loaded once per process and never reloaded. A config edit lands in the
+    # change set the watcher already samples, so it produces a digest line
+    # telling you to restart rather than being silently half-applied.
+    def project(options = {})
+      @project ||= Sidecar.load(root: Dir.pwd).then do |loaded|
+        options[:base] ? loaded.with(base: options[:base]) : loaded
+      end
+    end
+
+    def artifacts(options) = options[:dir] || project(options).artifacts_path
+
+    # Set by the compose fragment, so a pass knows which side of the wall it is
+    # on without being told twice.
+    def here = ENV["SIDECAR_CONTAINER"] == "1" ? :container : :host
+
+    def stack(options) = @stack ||= Sidecar::Stack.new(project: project(options))
+
+    def start(options)
+      caps = stack(options).limits
+      warn "Starting the sidecar stack — capped at #{caps['SIDECAR_CPUS']} cpu / #{caps['SIDECAR_MEMORY']}."
+      return EXIT_FAILED unless stack(options).start.success?
+
+      warn "Up. It is preparing its data plane and running a baseline sweep now —"
+      warn "`sidecar status` reports DOWN until that first pass lands."
+      EXIT_CLEAN
+    rescue Sidecar::Stack::MountMismatch => e
+      warn "Refusing to start: #{e.message}"
+      warn "The container would watch the wrong tree and report green forever."
+      EXIT_FAILED
+    end
+
+    def stop(options) = stack(options).stop.success? ? EXIT_CLEAN : EXIT_FAILED
+
+    # Reaches no further than the container's own data plane. Nothing of the
+    # developer's is touched.
+    def reseed(options)
+      return no_stack unless stack(options).running?
+      return warn("This project declares no seed command.") || EXIT_FAILED unless project(options).seed_command
+
+      warn "Rebuilding the data plane (minutes, not seconds)…"
+      stack(options).exec(*project(options).seed_command.split, quiet: true).success? ? EXIT_CLEAN : EXIT_FAILED
+    end
+
+    def no_stack
+      warn "The stack is not up — `sidecar start` first."
+      EXIT_FAILED
+    end
+
+    def usage
+      warn "sidecar: expected one of #{COMMANDS.join(', ')} — see `sidecar --help`."
+      EXIT_FAILED
+    end
+
+    # Prefers the container, because that is where a pass costs the developer
+    # nothing. Falls back here rather than failing, so the sidecar is still
+    # useful on a machine with no docker running.
+    def once(options)
+      return once_here(options) if options[:host] || here == :container || !stack(options).running?
+
+      once_in_container(options)
+    end
+
+    def once_here(options)
+      loaded = project(options)
+      change_set = Sidecar::ChangeSet.from_git(base: loaded.base)
+      results = Sidecar::Scan.new(change_set:, sensors: loaded.registry.fast,
+                                  project: loaded, location: here, tier: :fast).run
+      digest = Sidecar::Report.write(results:, change_set:, dir: artifacts(options),
+                                     project: loaded, location: here)
+
+      puts digest unless options[:quiet]
+      results.any?(&:actionable?) ? EXIT_RED : EXIT_CLEAN
+    end
+
+    # The container writes the digest to the mount both sides share, so this
+    # reads its own copy rather than the container's stdout.
+    def once_in_container(options)
+      result = stack(options).exec("bundle", "exec", "sidecar", "once", "--quiet",
+                                   "--base", project(options).base, quiet: true)
+      return container_failed(result) unless [ EXIT_CLEAN, EXIT_RED ].include?(result.exit_code)
+
+      puts digest_body(artifacts(options)) unless options[:quiet]
+      result.exit_code
+    end
+
+    def container_failed(result)
+      warn "The in-container pass failed (exit #{result.exit_code}) — the digest was not refreshed."
+      warn result.output.lines.last(3).join.strip unless result.output.strip.empty?
+      warn "Retry here with `sidecar once --host`."
+      EXIT_FAILED
+    end
+
+    # The merge gate. Differs from `once` in four ways, which is what makes it a
+    # command rather than four flags: it diffs a range rather than the working
+    # tree, runs only the sensors marked `gate:`, never prefers the container
+    # (CI has no docker and `once` would fall back silently), and writes no
+    # artifacts.
+    def gate(options)
+      loaded = project(options)
+      # The range is resolved BEFORE the sensor set is consulted, and the order
+      # is load-bearing. Checking "nothing to run" first would let a gate with an
+      # unfetched base, or one whose sensors someone unmarked, exit 0 without
+      # ever establishing that it could see the change at all — which is the
+      # failure this command exists to stop.
+      change_set = Sidecar::ChangeSet.from_range(base: loaded.base || "origin/main")
+
+      sensors = gate_sensors(loaded, options[:only])
+      return warn("No sensor is marked `gate:` — nothing to enforce.") || EXIT_CLEAN if sensors.empty?
+
+      results = Sidecar::Scan.new(change_set:, sensors:, project: loaded,
+                                  location: here, tier: :fast).run
+      report_gate(results)
+    rescue Sidecar::ChangeSet::BlindGate => e
+      warn "Gate refusing to run: #{e.message}"
+      warn "A guardrail that cannot see the change must never report clean."
+      EXIT_BLIND
+    end
+
+    def gate_sensors(loaded, only)
+      sensors = loaded.registry.gate_sensors
+      only ? sensors.select { |sensor| only.include?(sensor.id) } : sensors
+    end
+
+    def report_gate(results)
+      violations = results.flat_map(&:new_violations)
+      if violations.empty?
+        puts "✅ No new violations on changed lines (#{results.size} sensor(s))."
+        return EXIT_CLEAN
+      end
+
+      puts "❌ #{violations.size} new violation(s) introduced on changed lines:"
+      violations.sort_by { |v| [ v.file.to_s, v.line.to_i ] }
+                .each { |v| puts "  #{v.file}:#{v.line}  #{v.rule}\n      #{v.message}" }
+      results.filter_map(&:guidance).uniq.each { |line| puts "\n#{line}" }
+      EXIT_RED
+    end
+
+    # The on-demand half of the slow tier. The opportunistic half fires by itself
+    # once the tree has been quiet for a minute.
+    def run_tier(options)
+      unless options[:slow]
+        warn "sidecar run needs --slow (the fast tier is `sidecar once`)."
+        return EXIT_FAILED
+      end
+
+      return run_slow_in_container(options) if stack(options).running? && here != :container
+
+      warn "Running the slow tier here. It is not cancellable — expect minutes."
+      report_slow(watcher(options).run_slow_now)
+    end
+
+    # Silence would read as a hang. Scope filtering applies to an explicit run
+    # too, so "nothing to do" is a real and common answer that has to be said.
+    def report_slow(results)
+      if results.empty?
+        warn "Nothing to run — no slow sensor's scope has changed since it last ran."
+        return EXIT_CLEAN
+      end
+
+      ran, deferred = results.partition { |result| !result.deferred? }
+      warn "Ran #{ran.size} slow sensor(s)#{stale_note(ran)}." if ran.any?
+      warn "#{deferred.size} deferred — start the stack with `sidecar start`." if deferred.any?
+
+      ran.any?(&:actionable?) ? EXIT_RED : EXIT_CLEAN
+    end
+
+    def stale_note(results)
+      stale = results.count(&:stale?)
+      stale.positive? ? ", #{stale} stale (the tree moved while they ran)" : ""
+    end
+
+    def run_slow_in_container(options)
+      warn "Running the slow tier in the container. It is not cancellable — expect minutes."
+      result = stack(options).exec("bundle", "exec", "sidecar", "run", "--slow",
+                                   "--base", project(options).base, quiet: true)
+      return EXIT_CLEAN if result.success?
+
+      warn result.output.lines.last(3).join.strip
+      EXIT_FAILED
+    end
+
+    def watcher(options)
+      Sidecar::Watcher.new(project: project(options), location: here, dir: artifacts(options))
+    end
+
+    # Runs until killed. Ctrl-C is how a human running it directly gets out, and
+    # is not a failure.
+    def watch(options)
+      watcher(options).run
+      EXIT_CLEAN
+    rescue Interrupt
+      warn "\nStopped watching."
+      EXIT_CLEAN
+    end
+
+    def dashboard(options)
+      dir = artifacts(options)
+      return print("#{Sidecar::Dashboard.read(dir:).render}\n") || EXIT_CLEAN if options[:plain]
+
+      loop do
+        print "#{Sidecar::Dashboard::CLEAR}#{Sidecar::Dashboard.read(dir:).render}\n"
+        sleep Sidecar::Dashboard::REFRESH_INTERVAL
+      end
+    rescue Interrupt
+      EXIT_CLEAN
+    end
+
+    # Answers a different question from `once`. `once` reports whether the code
+    # is clean; this reports whether that answer is still current. A fresh pass
+    # with three red sensors exits 0 here — the digest is trustworthy, and what
+    # it says is that three things are wrong.
+    def status(options)
+      dir = artifacts(options)
+      liveness = Sidecar::Liveness.read(dir:)
+
+      puts liveness.headline
+      puts liveness.hint if liveness.hint
+      puts "⚠ #{liveness.version_skew}" if liveness.version_skew
+      puts
+      puts digest_body(dir)
+
+      liveness.exit_code
+    end
+
+    # The hook that calls this must never break a session, so it swallows
+    # everything rather than failing loudly — with one exception. An unreadable
+    # digest is the normal state before the first pass lands; a broken config
+    # never clears on its own, and a permanently quiet hook would hide it until
+    # someone wondered why the board never went green.
+    def nudge(options)
+      line = Sidecar::Liveness.read(dir: artifacts(options)).nudge
+      puts line if line
+      EXIT_CLEAN
+    rescue Sidecar::MissingConfig, Sidecar::Project::InvalidProject
+      puts "Sidecar: configuration problem — run `sidecar status`"
+      EXIT_CLEAN
+    rescue StandardError
+      EXIT_CLEAN
+    end
+
+    def digest_body(dir)
+      File.read(File.join(dir, Sidecar::Report::DIGEST_FILE)).strip
+    rescue Errno::ENOENT
+      "(no digest yet — run `sidecar once`)"
+    end
+  end
+end
+
+exit(Sidecar::CLI.run(ARGV)) if $PROGRAM_NAME == __FILE__

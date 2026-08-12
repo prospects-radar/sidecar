@@ -31,12 +31,26 @@ module Sidecar
   # answer it would then report as fact.
   Project = Data.define(
     :root, :artifacts, :base, :compose_file, :runner_service,
-    :workdir, :prepare_command, :locations, :registry, :load_ms
+    :workdir, :prepare_command, :seed_command, :data_plane_paths,
+    :locations, :registry, :load_ms
   ) do
     def initialize(root:, registry:, artifacts: "tmp/sidecar", base: "HEAD",
-                   compose_file: nil, runner_service: "runner", workdir: "/rails",
-                   prepare_command: nil, locations: {}, load_ms: nil)
+                   compose_file: nil, runner_service: "runner", workdir: "/app",
+                   prepare_command: nil, seed_command: nil, data_plane_paths: [],
+                   locations: {}, load_ms: nil)
       super
+    end
+
+    # Whether a changed file means the data plane has to be rebuilt before the
+    # next pass can be believed.
+    #
+    # Declared by the project rather than pattern-matched in core. The original
+    # carried `%r{\Adb/(migrate/|schema\.rb)}` — a Rails layout fact compiled
+    # into a gem that claims to know nothing about Rails.
+    def rebuilds_data_plane?(files)
+      return false if data_plane_paths.empty?
+
+      files.any? { |file| data_plane_paths.any? { |glob| File.fnmatch?(glob, file, File::FNM_PATHNAME) } }
     end
 
     def location(name) = locations.fetch(name) { Location.new(name:) }
@@ -81,7 +95,8 @@ module Sidecar
     # Simple scalar settings. Unknown names raise, which is a better error than a
     # version constraint would be: it names the setting and the file, where a
     # constraint names a number.
-    %i[artifacts base compose_file runner_service workdir prepare_command].each do |setting|
+    %i[artifacts base compose_file runner_service workdir
+       prepare_command seed_command data_plane_paths].each do |setting|
       define_method(setting) { |value| @settings[setting] = value }
     end
 
