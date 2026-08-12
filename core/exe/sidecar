@@ -354,4 +354,12 @@ module Sidecar
   end
 end
 
-exit(Sidecar::CLI.run(ARGV)) if $PROGRAM_NAME == __FILE__
+# Runs unconditionally. The `if $PROGRAM_NAME == __FILE__` guard this carried as
+# a project script is actively wrong for a gem executable: bundler invokes it
+# through a generated binstub that `load`s this file, so $PROGRAM_NAME is the
+# binstub and the guard is false. The CLI then does nothing and exits 0 —
+# reporting success while running no checks at all, which is the one thing a
+# guardrail must never do.
+#
+# Nothing requires this file, so there is no reason for the guard.
+exit(Sidecar::CLI.run(ARGV))

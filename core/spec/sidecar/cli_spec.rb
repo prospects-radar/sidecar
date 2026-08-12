@@ -154,6 +154,38 @@ RSpec.describe "exe/sidecar" do
     end
   end
 
+  # Invoked the way a consumer does, through bundler's generated binstub, rather
+  # than by spawning the file.
+  #
+  # The distinction is not academic. This file first carried an
+  # `if $PROGRAM_NAME == __FILE__` guard, correct for a project script and wrong
+  # for a gem executable: the binstub `load`s the file, so $PROGRAM_NAME is the
+  # binstub, the guard was false, and every command did nothing and exited 0.
+  # Every spec that spawned the file directly passed.
+  describe "through the binstub, as a consumer runs it" do
+    def bundled(*argv, dir:)
+      Open3.capture3({ "BUNDLE_GEMFILE" => File.join(GEM_ROOT, "Gemfile") },
+                     "bundle", "exec", "sidecar", *argv, chdir: dir)
+    end
+
+    it "actually runs, rather than exiting 0 having done nothing" do
+      with_project do
+        out, _err, status = bundled("status", dir: Dir.pwd)
+
+        expect(status.exitstatus).to eq(2)
+        expect(out).to include("SIDECAR DOWN")
+      end
+    end
+
+    it "reaches the same exit codes as a direct invocation" do
+      with_project do
+        _out, _err, status = bundled("gate", "--base", "HEAD", dir: Dir.pwd)
+
+        expect(status.exitstatus).to eq(3)
+      end
+    end
+  end
+
   describe "the command surface" do
     it "prints usage and exits 0 for --help" do
       out, _err, code = sidecar("--help")
