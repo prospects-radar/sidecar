@@ -1,0 +1,130 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/prospects-radar/sidecar/schema/status-v1.json",
+  "title": "Sidecar status.json",
+  "description": "The published integration contract for one pass. A pass execs into the runner container, so the process that wrote this file is routinely not one an integrator can call into — which is why the artifact is the contract and the Ruby classes are private.",
+  "type": "object",
+  "required": ["schema", "generated_at", "mode", "base", "changed_files", "tiers", "totals", "sensors"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "const": "sidecar.status/1",
+      "description": "Read this rather than the exit code when you need to know what produced the file: exit codes are keyed by command and 1 and 2 each mean two different things."
+    },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "mode": { "type": "string", "enum": ["ONCE", "WATCH", "SLOW", "GATE"] },
+    "base": { "type": "string", "description": "The git ref, or range, the change set was taken against." },
+    "core": {
+      "type": "object",
+      "required": ["version", "location"],
+      "additionalProperties": false,
+      "properties": {
+        "version": { "type": "string" },
+        "location": { "type": "string", "description": "Which execution location wrote this. Two locations on different core versions is a warning, not a refusal." }
+      }
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "load_ms": {
+          "type": ["integer", "null"],
+          "description": "How long the project's config took to load. Recorded rather than guarded: core cannot tell an expensive require from a legitimate one, so a config that boots Rails shows up as the number it is."
+        }
+      }
+    },
+    "changed_files": { "type": "array", "items": { "type": "string" } },
+    "tiers": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "fast": {
+          "type": "object",
+          "required": ["ran_at"],
+          "additionalProperties": false,
+          "properties": {
+            "ran_at": { "type": "string", "format": "date-time" },
+            "duration_ms": { "type": "integer" }
+          }
+        },
+        "slow": {
+          "type": "object",
+          "description": "Absent until the slow tier has actually produced something, so a reader can tell 'not run yet' from 'run and current'.",
+          "required": ["ran_at", "sensors", "stale"],
+          "additionalProperties": false,
+          "properties": {
+            "ran_at": { "type": "string", "format": "date-time" },
+            "sensors": { "type": "integer" },
+            "stale": { "type": "boolean", "description": "True when the verdict is about a tree that has since moved." }
+          }
+        }
+      }
+    },
+    "totals": {
+      "type": "object",
+      "required": ["red", "green", "deferred", "unavailable", "new_violations", "preexisting"],
+      "additionalProperties": false,
+      "properties": {
+        "red": { "type": "integer" },
+        "green": { "type": "integer" },
+        "deferred": { "type": "integer", "description": "Could not run here: this execution location lacks a resource the sensor needs." },
+        "unavailable": { "type": "integer", "description": "Could not run at all: the tool itself is not installed. A different problem from deferred, with a different fix." },
+        "new_violations": { "type": "integer" },
+        "preexisting": { "type": "integer" }
+      }
+    },
+    "sensors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "group", "tier", "state", "stale", "new", "preexisting", "targets"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "group": { "type": "string", "enum": ["setup", "lint", "test", "security", "build"] },
+          "tier": { "type": "string", "enum": ["fast", "slow"] },
+          "state": {
+            "type": "string",
+            "enum": ["green", "red", "deferred", "unavailable", "error"],
+            "description": "error means the tool ran and produced output core could not read — distinct from red, because a crashed linter and a real finding call for different responses."
+          },
+          "stale": {
+            "type": "boolean",
+            "description": "Orthogonal to state. A slow sensor can come back green about a tree that has since moved; the verdict is still green, it is just no longer about the code in front of you."
+          },
+          "new": { "$ref": "#/$defs/violations" },
+          "preexisting": { "$ref": "#/$defs/violations" },
+          "summary": { "type": ["string", "null"] },
+          "duration_ms": { "type": ["integer", "null"] },
+          "guidance": { "type": ["string", "null"], "description": "What to tell whoever this sensor just rejected." },
+          "targets": {
+            "type": "object",
+            "required": ["considered", "run"],
+            "additionalProperties": false,
+            "properties": {
+              "considered": { "type": "integer" },
+              "run": { "type": "integer", "description": "Lower than considered when a handler rewrites its input and the rewrite names paths that are not on disk — which is how a broken mapping presents." }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "violations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["file", "line", "rule", "message"],
+        "additionalProperties": false,
+        "properties": {
+          "file": { "type": "string", "description": "Repo-relative. Normalising is the handler's job, since only it knows its tool's path convention." },
+          "line": { "type": ["integer", "null"] },
+          "rule": { "type": ["string", "null"] },
+          "message": { "type": ["string", "null"] }
+        }
+      }
+    }
+  }
+}
