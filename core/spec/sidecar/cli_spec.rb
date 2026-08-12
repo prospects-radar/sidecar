@@ -15,9 +15,9 @@ RSpec.describe "exe/sidecar" do
   GEM_ROOT = File.expand_path("../..", __dir__)
   EXE = File.join(GEM_ROOT, "exe", "sidecar")
 
-  def sidecar(*argv)
+  def sidecar(*argv, env: {})
     out, err, status = Open3.capture3(
-      { "SIDECAR_CONTAINER" => nil },
+      { "SIDECAR_CONTAINER" => nil }.merge(env),
       RbConfig.ruby, "-I", File.join(GEM_ROOT, "lib"), EXE, *argv
     )
     [ out, err, status.exitstatus ]
@@ -95,6 +95,131 @@ RSpec.describe "exe/sidecar" do
         _out, _err, code = sidecar("once", "--quiet")
 
         expect(code).to eq(1)
+      end
+    end
+  end
+
+  # The artifact directory is a mount, fixed when the stack starts. Everything
+  # here is about the one thing that cannot be inferred from a host-side run:
+  # which directory the container was actually told to write.
+  describe "once, routed into the container" do
+    # A docker that reports the runner up and records what it was asked to run.
+    #
+    # This path is unreachable without one: `once` only execs when
+    # `docker compose ps` names the runner, and the real stack would need an
+    # image, a build and a minute per example. What the container does with the
+    # flag is not in question — that it receives the right one is.
+    def with_fake_docker(repo)
+      bin = File.join(repo.dir, "fakebin")
+      log = File.join(repo.dir, "docker.log")
+      FileUtils.mkdir_p(bin)
+      File.write(File.join(bin, "docker"), <<~RUBY)
+        #!#{RbConfig.ruby}
+        File.write(#{log.inspect}, ARGV.join(" ") + "\\n", mode: "a")
+        puts "runner" if ARGV.include?("ps")
+      RUBY
+      FileUtils.chmod(0o755, File.join(bin, "docker"))
+      yield log, { "PATH" => "#{bin}:#{ENV.fetch('PATH', '')}" }
+    end
+
+    def with_container_project(&) = with_project(%(compose_file "compose.yml"\n  workdir "/rails"), &)
+
+    # No log at all means docker was never reached, which counts as no exec.
+    def execs(log) = File.exist?(log) ? File.readlines(log).grep(/ exec /) : []
+
+    it "tells the container to write the directory the host will read" do
+      with_container_project do |repo|
+        with_fake_docker(repo) do |log, env|
+          sidecar("once", "--quiet", "--dir", "tmp/sidecar/pass-2", env:)
+
+          expect(execs(log).join).to include("--dir /rails/tmp/sidecar/pass-2")
+        end
+      end
+    end
+
+    it "names the mount even when no --dir was given" do
+      with_container_project do |repo|
+        with_fake_docker(repo) do |log, env|
+          sidecar("once", "--quiet", env:)
+
+          expect(execs(log).join).to include("--dir /rails/tmp/sidecar")
+        end
+      end
+    end
+
+    # The bug this closes. The digest was read from a directory the container
+    # had no way to write, so the pass reported on whatever happened to be
+    # lying there — a stale file, or nothing — beside a truthful exit code.
+    it "refuses a --dir outside the mount rather than reading a file the pass never wrote" do
+      with_container_project do |repo|
+        FileUtils.mkdir_p("tmp/elsewhere")
+        File.write("tmp/elsewhere/agent-summary.md", "a digest from some earlier pass\n")
+
+        with_fake_docker(repo) do |log, env|
+          out, err, code = sidecar("once", "--dir", "tmp/elsewhere", env:)
+
+          expect(code).to eq(2)
+          expect(err).to include("outside the artifact mount")
+          expect(out).not_to include("some earlier pass")
+          expect(execs(log)).to be_empty
+        end
+      end
+    end
+
+    # The escape hatch the refusal points at. A host-side pass writes wherever
+    # it is told, because no mount stands between it and the directory.
+    it "still writes an out-of-mount directory when the pass runs here" do
+      with_container_project do |repo|
+        with_fake_docker(repo) do |_log, env|
+          _out, _err, code = sidecar("once", "--quiet", "--host", "--dir", "tmp/elsewhere", env:)
+
+          expect(code).to eq(0)
+          expect(Dir.children("tmp/elsewhere")).to contain_exactly("status.json", "agent-summary.md")
+        end
+      end
+    end
+
+    # Same mount, same refusal. This one writes rather than reads, so getting it
+    # wrong loses the results instead of misreporting them.
+    it "refuses the same --dir on the slow tier" do
+      with_container_project do |repo|
+        with_fake_docker(repo) do |log, env|
+          _out, err, code = sidecar("run", "--slow", "--dir", "tmp/elsewhere", env:)
+
+          expect(code).to eq(2)
+          expect(err).to include("outside the artifact mount")
+          expect(execs(log)).to be_empty
+        end
+      end
+    end
+
+    # The refusal names a command you can actually run. Built from the command's
+    # own invocation rather than from the parsed name, which for the slow tier
+    # would have printed `sidecar run --host`: a line that exits 2 telling you
+    # --slow is missing.
+    it "suggests an invocation that works, on both tiers" do
+      with_container_project do |repo|
+        with_fake_docker(repo) do |_log, env|
+          _out, fast, = sidecar("once", "--dir", "tmp/elsewhere", env:)
+          _out, slow, = sidecar("run", "--slow", "--dir", "tmp/elsewhere", env:)
+
+          expect(fast).to include(%(sidecar once --host --dir "tmp/elsewhere"))
+          expect(slow).to include(%(sidecar run --slow --host --dir "tmp/elsewhere"))
+        end
+      end
+    end
+
+    # What the refusal above tells you to run. --host used to be parsed and then
+    # ignored here, so the advice would have been false for the slow tier.
+    it "takes --host on the slow tier too, rather than routing to the container anyway" do
+      with_container_project do |repo|
+        with_fake_docker(repo) do |log, env|
+          _out, err, code = sidecar("run", "--slow", "--host", "--dir", "tmp/elsewhere", env:)
+
+          expect(code).to eq(0)
+          expect(err).to include("Nothing to run")
+          expect(execs(log)).to be_empty
+        end
       end
     end
   end

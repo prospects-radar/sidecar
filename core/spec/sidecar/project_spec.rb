@@ -134,6 +134,55 @@ RSpec.describe "Sidecar.load" do
     end
   end
 
+  # The artifact directory is a mount, fixed when the stack starts. Asking where
+  # a host path lands on the other side of it is the question a container-routed
+  # pass has to answer before it forwards anything.
+  describe "#container_artifacts_path" do
+    def container_project(&)
+      with_config(minimal(%(compose_file "docker-compose.sidecar.yml"\n  workdir "/rails")), &)
+    end
+
+    it "maps the artifact directory itself onto the container's workdir" do
+      container_project do |repo|
+        expect(Sidecar.load.container_artifacts_path("#{repo.dir}/tmp/sidecar")).to eq("/rails/tmp/sidecar")
+      end
+    end
+
+    it "resolves a relative directory against the project root" do
+      container_project do
+        expect(Sidecar.load.container_artifacts_path("tmp/sidecar")).to eq("/rails/tmp/sidecar")
+      end
+    end
+
+    it "maps a subdirectory of the mount onto the container's side of it" do
+      container_project do
+        expect(Sidecar.load.container_artifacts_path("tmp/sidecar/pass-2")).to eq("/rails/tmp/sidecar/pass-2")
+      end
+    end
+
+    # nil is the signal to refuse. The container physically cannot write here,
+    # so forwarding the flag would not help and running without it would report
+    # on a file the pass never touched.
+    it "returns nil for a directory outside the mount" do
+      container_project do
+        expect(Sidecar.load.container_artifacts_path("tmp/elsewhere")).to be_nil
+      end
+    end
+
+    # A prefix match on the string alone would call this one inside the mount.
+    it "returns nil for a sibling that merely shares the mount's prefix" do
+      container_project do
+        expect(Sidecar.load.container_artifacts_path("tmp/sidecar-old")).to be_nil
+      end
+    end
+
+    it "returns nil for a path that climbs back out through .." do
+      container_project do
+        expect(Sidecar.load.container_artifacts_path("tmp/sidecar/../elsewhere")).to be_nil
+      end
+    end
+  end
+
   describe "#missing_for" do
     it "names what this location cannot give a sensor" do
       with_config(minimal) do

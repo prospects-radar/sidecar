@@ -57,6 +57,25 @@ module Sidecar
     def container? = locations.key?(:container)
     def artifacts_path = File.join(root, artifacts)
 
+    # Where a host artifact directory lands on the container's side of the
+    # mount, or nil when it lands outside it.
+    #
+    # The artifact directory is a mount, fixed when the stack starts, so a path
+    # outside it is unwritable from inside the container no matter how it is
+    # passed. nil is therefore the signal to refuse rather than to translate:
+    # a container-routed pass that ran anyway would write one file and report on
+    # another, and the exit code would be right while the digest was stale.
+    def container_artifacts_path(dir)
+      mount = File.expand_path(artifacts_path)
+      requested = File.expand_path(dir, root)
+      inside = File.join(workdir, artifacts)
+
+      return inside if requested == mount
+      return File.join(inside, requested.delete_prefix("#{mount}/")) if requested.start_with?("#{mount}/")
+
+      nil
+    end
+
     # What this location cannot give a sensor. Anything listed means the sensor
     # is deferred rather than skipped: a check that did not run must never read
     # like a check that passed.

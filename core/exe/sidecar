@@ -11,7 +11,7 @@
 #   sidecar stop
 #   sidecar reseed
 #   sidecar once   [--base REF] [--dir PATH] [--quiet] [--host]
-#   sidecar run --slow [--base REF] [--dir PATH]
+#   sidecar run --slow [--base REF] [--dir PATH] [--host]
 #   sidecar gate   --base REF [--only a,b]
 #   sidecar watch  [--base REF] [--dir PATH]
 #   sidecar status [--dir PATH]
@@ -162,8 +162,18 @@ module Sidecar
     # Prefers the container, because that is where a pass costs the developer
     # nothing. Falls back here rather than failing, so the sidecar is still
     # useful on a machine with no docker running.
+    #
+    # Shared by both tiers: `--host` has to mean the same thing on each, or the
+    # escape hatch the mount refusal points at works for one command and not the
+    # other.
+    def route_to_container?(options)
+      return false if options[:host] || here == :container
+
+      stack(options).running?
+    end
+
     def once(options)
-      return once_here(options) if options[:host] || here == :container || !stack(options).running?
+      return once_here(options) unless route_to_container?(options)
 
       once_in_container(options)
     end
@@ -182,13 +192,43 @@ module Sidecar
 
     # The container writes the digest to the mount both sides share, so this
     # reads its own copy rather than the container's stdout.
+    #
+    # Which makes the artifact directory the one flag that has to cross with the
+    # pass. Without it the container wrote its own default and the host read
+    # whatever was at `--dir`: an old digest, or none, beside an exit code taken
+    # from the pass that had just run. Both halves looked right and they
+    # described different passes.
     def once_in_container(options)
+      dir = container_artifacts(options) or return outside_mount(options, "once")
+
       result = stack(options).exec("bundle", "exec", "sidecar", "once", "--quiet",
-                                   "--base", project(options).base, quiet: true)
+                                   "--base", project(options).base, "--dir", dir, quiet: true)
       return container_failed(result) unless [ EXIT_CLEAN, EXIT_RED ].include?(result.exit_code)
 
       puts digest_body(artifacts(options)) unless options[:quiet]
       result.exit_code
+    end
+
+    # Where the container should write, or nil when the host asked for a
+    # directory the container cannot reach.
+    #
+    # The artifact directory is a mount, fixed when the stack starts, so this is
+    # not something forwarding the flag can fix — a path outside the mount is
+    # unwritable from inside no matter how it is passed.
+    def container_artifacts(options)
+      loaded = project(options)
+      loaded.container_artifacts_path(options[:dir] || loaded.artifacts_path)
+    end
+
+    # Takes the invocation to suggest rather than reading options[:command]: the
+    # slow tier is `run --slow`, and advice that dropped the flag would print a
+    # command that exits 2 telling you the flag is missing.
+    def outside_mount(options, invocation)
+      warn "Refusing to run in the container: #{options[:dir].inspect} is outside the artifact mount " \
+           "(#{project(options).artifacts_path}), which the container cannot write."
+      warn "The mount is fixed when the stack starts. Run the pass here instead:"
+      warn "  sidecar #{invocation} --host --dir #{options[:dir].inspect}"
+      EXIT_FAILED
     end
 
     def container_failed(result)
@@ -251,7 +291,7 @@ module Sidecar
         return EXIT_FAILED
       end
 
-      return run_slow_in_container(options) if stack(options).running? && here != :container
+      return run_slow_in_container(options) if route_to_container?(options)
 
       warn "Running the slow tier here. It is not cancellable — expect minutes."
       report_slow(watcher(options).run_slow_now)
@@ -277,10 +317,16 @@ module Sidecar
       stale.positive? ? ", #{stale} stale (the tree moved while they ran)" : ""
     end
 
+    # The same mount, refused for the same reason. This half writes rather than
+    # reads, so an unforwarded --dir loses the slow tier's results in the mount
+    # instead of misreporting them — quieter still, and the reason the refusal
+    # belongs on both rather than only on the half that reads back.
     def run_slow_in_container(options)
+      dir = container_artifacts(options) or return outside_mount(options, "run --slow")
+
       warn "Running the slow tier in the container. It is not cancellable — expect minutes."
       result = stack(options).exec("bundle", "exec", "sidecar", "run", "--slow",
-                                   "--base", project(options).base, quiet: true)
+                                   "--base", project(options).base, "--dir", dir, quiet: true)
       return EXIT_CLEAN if result.success?
 
       warn result.output.lines.last(3).join.strip
