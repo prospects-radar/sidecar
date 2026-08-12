@@ -1,0 +1,38 @@
+# Standalone on purpose. The commissioning project's config inherits
+# rubocop-rails-omakase (Rails cops, in a repo whose CI asserts Rails is never
+# loaded) and requires ai-rubocops (45 private cops about Phlex components and
+# service architecture). Neither applies here, and inheriting either would put a
+# Rails dependency in the gem that exists to have none.
+#
+# One config for both gems: core/ and rails/ share a style, and two would drift.
+
+AllCops:
+  TargetRubyVersion: 4.0
+  NewCops: enable
+  Exclude:
+    - "vendor/**/*"
+    - "**/tmp/**/*"
+
+# Every file carries the magic comment already.
+Style/FrozenStringLiteralComment:
+  Enabled: true
+
+Style/Documentation:
+  Enabled: false
+
+Layout/LineLength:
+  Max: 120
+  Exclude:
+    # Heredocs building fixture repositories and canned tool output read worse
+    # wrapped than long.
+    - "core/spec/support/**/*.rb"
+
+Metrics/BlockLength:
+  Exclude:
+    - "**/spec/**/*.rb"
+    - "**/*.gemspec"
+
+Metrics/MethodLength:
+  Max: 20
+
+# No .rubocop_todo.yml. A repo with no debt should not ship a debt file.

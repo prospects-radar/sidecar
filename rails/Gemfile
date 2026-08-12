@@ -1,0 +1,18 @@
+# frozen_string_literal: true
+
+source "https://rubygems.org"
+
+gemspec
+
+# Resolved by path rather than by the gemspec's `~> 0.1`, so a change to core is
+# tested against the pack on every push. The consequence, accepted deliberately:
+# the version constraint is never exercised here.
+gem "sidecar-core", path: "../core"
+
+group :test do
+  gem "rspec", "~> 3.13"
+end
+
+group :development do
+  gem "rubocop", "~> 1.75", require: false
+end

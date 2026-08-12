@@ -1,0 +1,11 @@
+/pkg/
+/*.gem
+/.bundle/
+/vendor/bundle/
+/tmp/
+/coverage/
+
+# Per-gem locks are deliberately not committed. A gem's suite should fail when a
+# dependency's new release breaks it; the root lock pins the development shell.
+/core/Gemfile.lock
+/rails/Gemfile.lock

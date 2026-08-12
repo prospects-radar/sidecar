@@ -1,0 +1,18 @@
+# frozen_string_literal: true
+
+source "https://rubygems.org"
+
+# sidecar-core's own dependencies. The gemspec declares none at runtime, which is
+# the point: everything below is development-only.
+gemspec
+
+group :test do
+  gem "rspec", "~> 3.13"
+  # Validates status.json against the schema this gem ships. A dev dependency
+  # only — core must never require it at runtime.
+  gem "json_schemer", "~> 2.4"
+end
+
+group :development do
+  gem "rubocop", "~> 1.75", require: false
+end

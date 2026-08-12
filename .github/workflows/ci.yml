@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Deliberately no `paths:` filters. sidecar-rails depends on sidecar-core, so
+# filtering core's job to `core/**` would mean a core change never runs the pack's
+# suite — and that suite is exactly what catches core renaming Sidecar.define.
+# Two suites with no services cost under a minute; filtering them would optimise
+# the thing that is not slow while dropping the only coupling check in the repo.
+#
+# Also deliberately no Ruby matrix and no lint lane. The gemspecs declare the one
+# Ruby this tests, and a red lint lane on day one gets disabled rather than fixed.
+
+jobs:
+  core:
+    name: sidecar-core
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: core
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+          bundler: latest
+          bundler-cache: true
+          working-directory: core
+
+      # git identity: the changed-line gate's specs build real repositories and
+      # commit into them, which git refuses to do for an unconfigured user.
+      - name: Configure git for fixture repositories
+        run: |
+          git config --global user.email "ci@example.com"
+          git config --global user.name "Sidecar CI"
+          git config --global init.defaultBranch main
+
+      - name: Run the suite
+        run: bundle exec rspec
+
+      # This job declares no `services:` and installs nothing but Ruby and git.
+      # If it ever needs a database, a browser or a node toolchain, the core has
+      # stopped being dependency-free and the split has drifted.
+      - name: Build the gem
+        run: gem build sidecar-core.gemspec
+
+  rails:
+    name: sidecar-rails
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rails
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+          bundler: latest
+          bundler-cache: true
+          working-directory: rails
+
+      - name: Run the suite
+        run: bundle exec rspec
+
+      - name: Build the gem
+        run: gem build sidecar-rails.gemspec
