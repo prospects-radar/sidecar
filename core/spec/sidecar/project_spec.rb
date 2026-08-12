@@ -112,6 +112,19 @@ RSpec.describe "Sidecar.load" do
       end
     end
 
+    # git check-ignore exits 1 for "not ignored" and 128 for "I cannot answer" —
+    # not a repository, or a checkout the current user does not own, which is the
+    # ordinary state of a CI container. Reading 128 as a finding turned "git
+    # could not tell me" into a refusal that took down every command, including
+    # `nudge`, and it broke this project's CI on the first push.
+    it "does not refuse when git cannot answer at all" do
+      with_config(minimal) do |repo|
+        FileUtils.rm_rf(File.join(repo.dir, ".git"))
+
+        expect { Sidecar.load }.not_to raise_error
+      end
+    end
+
     # Better than a version constraint: it names the setting and the file, where
     # a constraint would name a number.
     it "refuses an unknown setting by name" do

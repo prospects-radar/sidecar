@@ -202,9 +202,21 @@ module Sidecar
       # directory makes every pass produce the change that triggers the next. It
       # never settles, and it presents as a busy sidecar rather than as a
       # misconfiguration.
+      # git check-ignore answers with an exit code: 0 ignored, 1 NOT ignored,
+      # anything else (128) means git declined to answer at all — not a
+      # repository, or a checkout whose owner is not the current user, which is
+      # the ordinary state of a CI container.
+      #
+      # Only 1 is a finding. Treating every non-zero code as "not ignored" turns
+      # "git could not tell me" into a refusal, and a refusal here takes down
+      # every command: the loop, the gate and `nudge` alike. That breaks the
+      # never-hinder tenet over a question nobody managed to ask, which is a
+      # worse failure than the misconfiguration this guards against.
+      NOT_IGNORED = 1
+
       def tracked_artifacts!
         _out, _err, status = Open3.capture3("git", "-C", project.root, "check-ignore", "-q", project.artifacts)
-        return if status.success?
+        return unless status.exitstatus == NOT_IGNORED
 
         raise InvalidProject,
               "artifacts path #{project.artifacts.inspect} is not git-ignored. The watcher writes there and " \
