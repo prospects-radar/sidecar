@@ -40,13 +40,36 @@ module Sidecar
       built
     end
 
-    # Apply a pack: anything responding to #apply(registry). A pack is the part
-    # every member of a class of codebase would otherwise write identically.
+    # Apply a pack: the part every member of a class of codebase would otherwise
+    # write identically.
+    #
+    # The primary form is **data** — a Hash carrying `sensors:` — rather than an
+    # object with an #apply method. That is what lets a shipped pack be checked
+    # mechanically for defining no methods and shelling out nowhere: a pack that
+    # can run code is a pack that can do anything, and the rule that keeps the
+    # Rails companion honest is only enforceable if there is nothing to run.
+    #
+    # An object responding to #apply is still accepted, for a project assembling
+    # its own sensors programmatically. That is the project's own risk to take;
+    # the gem does not take it.
     def use(pack)
-      pack.apply(self)
+      if pack.respond_to?(:apply)
+        pack.apply(self)
+      else
+        Array(pack.fetch(:sensors, [])).each do |entry|
+          attrs = entry.dup
+          sensor(attrs.delete(:id), **attrs)
+        end
+      end
       @applied_packs << pack
       self
     end
+
+    # What a pack suggests for settings a project has not stated. Never applied
+    # silently: a pack cannot see the machine, so `provides` is deliberately not
+    # among these — a pack asserting node would hand half its consumers a failing
+    # sensor where the honest answer is unavailable.
+    def self.defaults_in(pack) = pack.respond_to?(:fetch) ? pack.fetch(:defaults, {}) : {}
 
     # Replace named attributes on an existing sensor, keeping the rest and
     # keeping its position.
